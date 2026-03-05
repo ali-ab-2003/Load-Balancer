@@ -2,7 +2,7 @@
 
 const http = require('http');
 
-// ── CLI Arguments ─────────────────────────────────────────────────────────────
+// ── CLI Arguments 
 const [, , SERVER_ID, PORT_ARG] = process.argv;
 
 if (!SERVER_ID || !PORT_ARG) {
@@ -18,13 +18,13 @@ if (isNaN(PORT) || PORT < 1 || PORT > 65535) {
     process.exit(1);
 }
 
-// ── Logger ────────────────────────────────────────────────────────────────────
+// ── Logger 
 function log(message) {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [${SERVER_ID}] ${message}`);
 }
 
-// ── Request Handler ───────────────────────────────────────────────────────────
+// ── Request Handler 
 function handleRequest(req, res) {
     const timestamp = new Date().toISOString();
 
@@ -49,7 +49,7 @@ function handleRequest(req, res) {
     res.end(body);
 }
 
-// ── Server Setup ──────────────────────────────────────────────────────────────
+// ── Server Setup 
 const server = http.createServer(handleRequest);
 
 // Graceful shutdown
