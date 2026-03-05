@@ -4,9 +4,10 @@ const http = require('http');
 
 // ── Configuration 
 const LB_PORT            = 8080;
-const HEALTH_INTERVAL_MS = 3000;   // check every 3 seconds
-const HEALTH_TIMEOUT_MS  = 2000;   // mark down if no reply within 2s
-const MAX_RETRIES        = 2;      // retry across live backends before giving up
+const METRICS_PORT       = 8090;
+const HEALTH_INTERVAL_MS = 3000;
+const HEALTH_TIMEOUT_MS  = 2000;
+const MAX_RETRIES        = 2;
 
 const BACKENDS = [
   { host: 'localhost', port: 5001, id: 'server-1' },
@@ -14,24 +15,63 @@ const BACKENDS = [
   { host: 'localhost', port: 5003, id: 'server-3' },
 ];
 
-// ── Server State 
-// Each entry: { host, port, id, alive: bool, failures: number }
+// ── Metrics Store 
+const metrics = {
+  startTime      : Date.now(),
+  totalRequests  : 0,
+  totalSuccesses : 0,
+  totalFailures  : 0,
+  servers        : Object.fromEntries(
+    BACKENDS.map((b) => [
+      b.id,
+      { requests: 0, failures: 0, latencySum: 0, latencyCount: 0, alive: true },
+    ]),
+  ),
+};
+
+function recordSuccess(serverId, latencyMs) {
+  metrics.totalRequests++;
+  metrics.totalSuccesses++;
+  const s = metrics.servers[serverId];
+  if (s) { s.requests++; s.latencySum += latencyMs; s.latencyCount++; }
+}
+
+function recordFailure(serverId) {
+  metrics.totalRequests++;
+  metrics.totalFailures++;
+  const s = metrics.servers[serverId];
+  if (s) { s.requests++; s.failures++; }
+}
+
+function getSnapshot() {
+  const uptimeSec = ((Date.now() - metrics.startTime) / 1000).toFixed(1);
+  return {
+    uptimeSec,
+    totalRequests  : metrics.totalRequests,
+    totalSuccesses : metrics.totalSuccesses,
+    totalFailures  : metrics.totalFailures,
+    throughput     : uptimeSec > 0
+      ? +(metrics.totalRequests / uptimeSec).toFixed(2) : 0,
+    servers: Object.entries(metrics.servers).map(([id, s]) => ({
+      id,
+      alive        : s.alive,
+      requests     : s.requests,
+      failures     : s.failures,
+      avgLatencyMs : s.latencyCount > 0 ? Math.round(s.latencySum / s.latencyCount) : null,
+    })),
+  };
+}
+
+// ── Server Registry 
 const registry = BACKENDS.map((b) => ({ ...b, alive: true, failures: 0 }));
 
 // ── Logger 
-const RESET  = '\x1b[0m';
-const GREEN  = '\x1b[32m';
-const RED    = '\x1b[31m';
-const YELLOW = '\x1b[33m';
-const CYAN   = '\x1b[36m';
-const DIM    = '\x1b[2m';
-
+const RESET = '\x1b[0m'; const GREEN = '\x1b[32m'; const RED = '\x1b[31m';
+const YELLOW = '\x1b[33m'; const CYAN = '\x1b[36m'; const DIM = '\x1b[2m';
 function ts() { return new Date().toISOString(); }
-
 function log(color, tag, msg) {
   console.log(`${DIM}[${ts()}]${RESET} ${color}[${tag}]${RESET} ${msg}`);
 }
-
 const logger = {
   req  : (msg) => log(CYAN,   'REQUEST', msg),
   up   : (msg) => log(GREEN,  'UP     ', msg),
@@ -45,11 +85,7 @@ function pingServer(server) {
   return new Promise((resolve) => {
     const req = http.get(
       { hostname: server.host, port: server.port, path: '/', timeout: HEALTH_TIMEOUT_MS },
-      (res) => {
-        // Drain the response so the socket is released
-        res.resume();
-        resolve(res.statusCode >= 200 && res.statusCode < 500);
-      },
+      (res) => { res.resume(); resolve(res.statusCode < 500); },
     );
     req.on('timeout', () => { req.destroy(); resolve(false); });
     req.on('error',   ()  => resolve(false));
@@ -60,156 +96,121 @@ async function runHealthChecks() {
   for (const server of registry) {
     const wasAlive = server.alive;
     const isAlive  = await pingServer(server);
-
     if (isAlive) {
       server.failures = 0;
       if (!wasAlive) {
         server.alive = true;
-        logger.up(`${server.id} (${server.host}:${server.port}) is back online ✓`);
-        logRegistryStatus();
+        metrics.servers[server.id].alive = true;
+        logger.up(`${server.id} is back ONLINE ✓`);
       }
     } else {
       server.failures++;
       if (wasAlive) {
         server.alive = false;
-        logger.down(`${server.id} (${server.host}:${server.port}) is unreachable ✗`);
-        logRegistryStatus();
+        metrics.servers[server.id].alive = false;
+        logger.down(`${server.id} is UNREACHABLE ✗`);
       }
     }
   }
 }
 
 function startHealthChecks() {
-  // Stagger: run immediately, then on interval
   runHealthChecks();
   setInterval(runHealthChecks, HEALTH_INTERVAL_MS);
 }
 
-function logRegistryStatus() {
-  const summary = registry
-    .map((s) => `${s.id}:${s.alive ? `${GREEN}UP${RESET}` : `${RED}DOWN${RESET}`}`)
-    .join('  ');
-  logger.info(`Backend status → ${summary}`);
-}
-
-// ── Round Robin (live servers only) 
+// ── Round Robin 
 let rrIndex = 0;
-
 function getNextLiveBackend(excluded = new Set()) {
   const live = registry.filter((s) => s.alive && !excluded.has(s.id));
-  if (live.length === 0) return null;
-
-  // Advance round-robin pointer until we land on a live server
+  if (!live.length) return null;
   let attempts = 0;
   while (attempts < registry.length) {
-    const candidate = registry[rrIndex % registry.length];
-    rrIndex = (rrIndex + 1) % registry.length;
-    if (candidate.alive && !excluded.has(candidate.id)) return candidate;
+    const c = registry[rrIndex % registry.length];
+    rrIndex  = (rrIndex + 1) % registry.length;
+    if (c.alive && !excluded.has(c.id)) return c;
     attempts++;
   }
-  // Fallback: just pick the first available live server
   return live[0];
 }
 
-// ── HTTP Proxy 
-function forwardTo(server, clientReq, clientRes, attempt = 1, tried = new Set()) {
+// ── Proxy 
+function forwardTo(server, clientReq, clientRes, startMs, attempt = 1, tried = new Set()) {
   tried.add(server.id);
-
-  const options = {
-    hostname : server.host,
-    port     : server.port,
-    path     : clientReq.url,
-    method   : clientReq.method,
-    headers  : {
-      ...clientReq.headers,
-      'x-forwarded-for' : clientReq.socket.remoteAddress,
-      'x-forwarded-by'  : 'node-lb-health',
-    },
-  };
-
-  // We need to buffer the body so we can replay it on retry
-  const body = clientReq._lbBody;     // set before first call
-
-  const proxyReq = http.request(options, (proxyRes) => {
-    logger.req(
-      `${clientReq.method} ${clientReq.url} → ${server.id}:${server.port}  ` +
-      `[HTTP ${proxyRes.statusCode}]` +
-      (attempt > 1 ? ` (retry #${attempt - 1})` : ''),
-    );
-
-    clientRes.writeHead(proxyRes.statusCode, {
-      ...proxyRes.headers,
-      'x-handled-by': `${server.id}:${server.port}`,
-    });
+  const proxyReq = http.request({
+    hostname : server.host, port: server.port,
+    path: clientReq.url, method: clientReq.method,
+    headers: { ...clientReq.headers, 'x-forwarded-for': clientReq.socket.remoteAddress },
+  }, (proxyRes) => {
+    const latency = Date.now() - startMs;
+    recordSuccess(server.id, latency);
+    logger.req(`${clientReq.method} ${clientReq.url} → ${server.id} [${proxyRes.statusCode}] ${latency}ms`);
+    clientRes.writeHead(proxyRes.statusCode, { ...proxyRes.headers, 'x-handled-by': server.id });
     proxyRes.pipe(clientRes, { end: true });
   });
 
   proxyReq.on('error', (err) => {
-    logger.err(`${server.id}:${server.port} → ${err.message}`);
-
-    // Opportunistically mark this server down immediately
-    if (server.alive) {
-      server.alive = false;
-      logger.down(`${server.id} marked DOWN after request failure`);
-      logRegistryStatus();
-    }
-
+    recordFailure(server.id);
+    logger.err(`${server.id} → ${err.message}`);
+    if (server.alive) { server.alive = false; metrics.servers[server.id].alive = false; }
     if (attempt <= MAX_RETRIES) {
       const next = getNextLiveBackend(tried);
-      if (next) {
-        logger.info(`Retrying → ${next.id}:${next.port}  (attempt ${attempt + 1})`);
-        return forwardTo(next, clientReq, clientRes, attempt + 1, tried);
-      }
+      if (next) return forwardTo(next, clientReq, clientRes, startMs, attempt + 1, tried);
     }
-
-    // All retries exhausted
     if (!clientRes.headersSent) {
-      const errBody = JSON.stringify({
-        error   : 'Service Unavailable',
-        message : 'No healthy backend servers are available.',
-      });
       clientRes.writeHead(503, { 'Content-Type': 'application/json' });
-      clientRes.end(errBody);
+      clientRes.end(JSON.stringify({ error: 'Service Unavailable' }));
     }
   });
 
-  // Write buffered body (needed for POST/PUT retries)
+  const body = clientReq._lbBody;
   if (body && body.length) proxyReq.write(body);
   proxyReq.end();
 }
 
-// ── Request Handler 
 function handleRequest(clientReq, clientRes) {
-  // Buffer the request body once so retries can replay it
-  const chunks = [];
+  const startMs = Date.now();
+  const chunks  = [];
   clientReq.on('data', (c) => chunks.push(c));
   clientReq.on('end', () => {
     clientReq._lbBody = Buffer.concat(chunks);
-
     const server = getNextLiveBackend();
     if (!server) {
-      logger.err('No live backends available for incoming request');
-      const errBody = JSON.stringify({
-        error   : 'Service Unavailable',
-        message : 'All backend servers are currently down.',
-      });
+      metrics.totalRequests++;
+      metrics.totalFailures++;
       clientRes.writeHead(503, { 'Content-Type': 'application/json' });
-      return clientRes.end(errBody);
+      return clientRes.end(JSON.stringify({ error: 'All backends down' }));
     }
-
-    forwardTo(server, clientReq, clientRes);
+    forwardTo(server, clientReq, clientRes, startMs);
   });
 }
 
-// ── Server Boot 
-const server = http.createServer(handleRequest);
+// ── Metrics Server (port 8090) 
+const metricsServer = http.createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
+  if (req.url === '/metrics' || req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(getSnapshot(), null, 2));
+  }
+  res.writeHead(404); res.end('Not found');
+});
 
-process.on('SIGINT',  () => { logger.info('Shutting down…'); server.close(() => process.exit(0)); });
-process.on('SIGTERM', () => { logger.info('Shutting down…'); server.close(() => process.exit(0)); });
+// ── Boot 
+const lbServer = http.createServer(handleRequest);
+lbServer.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') { logger.err(`Port ${LB_PORT} already in use.`); process.exit(1); }
+  else throw err;
+});
 
-server.listen(LB_PORT, () => {
-  logger.info(`Load balancer (health-aware) listening on port ${LB_PORT}`);
-  logger.info(`Backends : ${registry.map((b) => `${b.id} → ${b.host}:${b.port}`).join(' | ')}`);
-  logger.info(`Health check every ${HEALTH_INTERVAL_MS / 1000}s  |  Timeout ${HEALTH_TIMEOUT_MS / 1000}s  |  Max retries ${MAX_RETRIES}`);
+process.on('SIGINT',  () => { lbServer.close(); metricsServer.close(); process.exit(0); });
+process.on('SIGTERM', () => { lbServer.close(); metricsServer.close(); process.exit(0); });
+
+lbServer.listen(LB_PORT, () => {
+  logger.info(`Load balancer      → http://localhost:${LB_PORT}`);
   startHealthChecks();
+});
+metricsServer.listen(METRICS_PORT, () => {
+  logger.info(`Metrics API        → http://localhost:${METRICS_PORT}/metrics`);
+  logger.info(`Open dashboard.html in your browser to see live charts`);
 });
