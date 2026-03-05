@@ -1,0 +1,137 @@
+version: "3.9"
+
+# ── Shared Network ─────────────────────────────────────────────────────────────
+networks:
+  lb-net:
+    driver: bridge
+
+# ── Services ───────────────────────────────────────────────────────────────────
+services:
+
+  # ── Backend Server 1 ─────────────────────────────────────────────────────────
+  server-1:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: server-1
+    environment:
+      SERVER_ID: server-1
+      PORT: "5001"
+    ports:
+      - "5001:5001"           # expose to host for direct curl testing
+    networks:
+      - lb-net
+    restart: unless-stopped   # 🔄 auto-restart on crash
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5001"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+  # ── Backend Server 2 ─────────────────────────────────────────────────────────
+  server-2:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: server-2
+    environment:
+      SERVER_ID: server-2
+      PORT: "5002"
+    ports:
+      - "5002:5002"
+    networks:
+      - lb-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5002"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+  # ── Backend Server 3 ─────────────────────────────────────────────────────────
+  server-3:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: server-3
+    environment:
+      SERVER_ID: server-3
+      PORT: "5003"
+    ports:
+      - "5003:5003"
+    networks:
+      - lb-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5003"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+  # ── Load Balancer ─────────────────────────────────────────────────────────────
+  load-balancer:
+    build:
+      context: ./loadbalancer
+      dockerfile: Dockerfile
+    container_name: load-balancer
+    environment:
+      # Docker service names resolve as hostnames on lb-net
+      BACKENDS: >-
+        [
+          {"host":"server-1","port":5001,"id":"server-1"},
+          {"host":"server-2","port":5002,"id":"server-2"},
+          {"host":"server-3","port":5003,"id":"server-3"}
+        ]
+    ports:
+      - "8080:8080"           # load balancer
+      - "8090:8090"           # metrics API
+    networks:
+      - lb-net
+    depends_on:               # wait for backends to start (not healthy)
+      - server-1
+      - server-2
+      - server-3
+    restart: unless-stopped   # 🔄 auto-restart on crash
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  # ── Dashboard (static file server) ───────────────────────────────────────────
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    ports:
+      - "3000:3000"           # open http://localhost:3000 in your browser
+    networks:
+      - lb-net
+    depends_on:
+      - load-balancer
+    restart: unless-stopped
+
+  # ── Traffic Simulator ─────────────────────────────────────────────────────────
+  # This is a one-shot container — it runs, prints the report, then exits.
+  # Run it manually:  docker-compose run --rm simulator
+  # Or override vars: docker-compose run -e TOTAL_REQUESTS=5000 -e CONCURRENCY=100 --rm simulator
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: simulator
+    environment:
+      TARGET_URL: http://load-balancer:8080
+      TOTAL_REQUESTS: "1000"
+      CONCURRENCY: "50"
+    networks:
+      - lb-net
+    depends_on:
+      - load-balancer
+    profiles:
+      - simulator             # only starts when explicitly requested
