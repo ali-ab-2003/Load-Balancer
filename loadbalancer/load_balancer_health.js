@@ -23,7 +23,7 @@ const MAX_RETRIES        = 2;
 function parseBackends() {
   // Render deployment: set individual env vars per backend
   // e.g. BACKEND_1=https://lb-backend-server-1.onrender.com
-  const fromEnv = ['BACKEND_1', 'BACKEND_2', 'BACKEND_3']
+  const fromEnv = ['https://lb-backend-server-11.onrender.com', 'https://lb-backend-server-2.onrender.com', 'https://lb-backend-server-3.onrender.com']
     .map((key, i) => {
       const url = process.env[key];
       if (!url) return null;
