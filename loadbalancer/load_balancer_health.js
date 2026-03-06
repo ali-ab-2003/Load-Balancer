@@ -2,7 +2,7 @@
 
 const http = require('http');
 
-// ── Configuration ─────────────────────────────────────────────────────────────
+// ── Configuration 
 const LB_PORT            = 8080;
 const METRICS_PORT       = 8090;
 const HEALTH_INTERVAL_MS = 3000;
@@ -12,15 +12,44 @@ const MAX_RETRIES        = 2;
 // Backends can be overridden via BACKENDS env var as JSON, e.g.:
 // BACKENDS='[{"host":"server-1","port":5001,"id":"server-1"}]'
 // Falls back to localhost defaults for running outside Docker.
-const BACKENDS = process.env.BACKENDS
-  ? JSON.parse(process.env.BACKENDS)
-  : [
-      { host: 'localhost', port: 5001, id: 'server-1' },
-      { host: 'localhost', port: 5002, id: 'server-2' },
-      { host: 'localhost', port: 5003, id: 'server-3' },
-    ];
+// const BACKENDS = process.env.BACKENDS
+//   ? JSON.parse(process.env.BACKENDS)
+//   : [
+//       { host: 'localhost', port: 5001, id: 'server-1' },
+//       { host: 'localhost', port: 5002, id: 'server-2' },
+//       { host: 'localhost', port: 5003, id: 'server-3' },
+//     ];
 
-// ── Metrics Store ─────────────────────────────────────────────────────────────
+function parseBackends() {
+  // Render deployment: set individual env vars per backend
+  // e.g. BACKEND_1=https://lb-backend-server-1.onrender.com
+  const fromEnv = ['BACKEND_1', 'BACKEND_2', 'BACKEND_3']
+    .map((key, i) => {
+      const url = process.env[key];
+      if (!url) return null;
+      const parsed = new URL(url);
+      return {
+        id   : `server-${i + 1}`,
+        host : parsed.hostname,
+        port : parsed.protocol === 'https:' ? 443 : 80,
+        tls  : parsed.protocol === 'https:',
+      };
+    })
+    .filter(Boolean);
+
+  if (fromEnv.length > 0) return fromEnv;
+
+  // Local fallback
+  return [
+    { host: 'localhost', port: 5001, id: 'server-1', tls: false },
+    { host: 'localhost', port: 5002, id: 'server-2', tls: false },
+    { host: 'localhost', port: 5003, id: 'server-3', tls: false },
+  ];
+}
+
+const BACKENDS = parseBackends();
+
+// ── Metrics Store 
 const metrics = {
   startTime      : Date.now(),
   totalRequests  : 0,
@@ -67,10 +96,10 @@ function getSnapshot() {
   };
 }
 
-// ── Server Registry ───────────────────────────────────────────────────────────
+// ── Server Registry 
 const registry = BACKENDS.map((b) => ({ ...b, alive: true, failures: 0 }));
 
-// ── Logger ────────────────────────────────────────────────────────────────────
+// ── Logger 
 const RESET = '\x1b[0m'; const GREEN = '\x1b[32m'; const RED = '\x1b[31m';
 const YELLOW = '\x1b[33m'; const CYAN = '\x1b[36m'; const DIM = '\x1b[2m';
 function ts() { return new Date().toISOString(); }
@@ -85,10 +114,11 @@ const logger = {
   err  : (msg) => log(RED,    'ERROR  ', msg),
 };
 
-// ── Health Checks ─────────────────────────────────────────────────────────────
+// ── Health Checks 
 function pingServer(server) {
   return new Promise((resolve) => {
-    const req = http.get(
+    const lib = server.tls ? require('https') : require('http');
+    const req = lib.get(
       { hostname: server.host, port: server.port, path: '/', timeout: HEALTH_TIMEOUT_MS },
       (res) => { res.resume(); resolve(res.statusCode < 500); },
     );
@@ -124,7 +154,7 @@ function startHealthChecks() {
   setInterval(runHealthChecks, HEALTH_INTERVAL_MS);
 }
 
-// ── Round Robin ───────────────────────────────────────────────────────────────
+// ── Round Robin 
 let rrIndex = 0;
 function getNextLiveBackend(excluded = new Set()) {
   const live = registry.filter((s) => s.alive && !excluded.has(s.id));
@@ -139,25 +169,38 @@ function getNextLiveBackend(excluded = new Set()) {
   return live[0];
 }
 
-// ── Proxy ─────────────────────────────────────────────────────────────────────
+// ── Proxy 
 function forwardTo(server, clientReq, clientRes, startMs, attempt = 1, tried = new Set()) {
   tried.add(server.id);
-  const proxyReq = http.request({
-    hostname : server.host, port: server.port,
-    path: clientReq.url, method: clientReq.method,
-    headers: { ...clientReq.headers, 'x-forwarded-for': clientReq.socket.remoteAddress },
+  const lib = server.tls ? require('https') : require('http');
+  const proxyReq = lib.request({
+    hostname : server.host,
+    port     : server.port,
+    path     : clientReq.url,
+    method   : clientReq.method,
+    headers  : {
+      ...clientReq.headers,
+      'host'            : server.host,
+      'x-forwarded-for' : clientReq.socket.remoteAddress,
+    },
   }, (proxyRes) => {
     const latency = Date.now() - startMs;
     recordSuccess(server.id, latency);
     logger.req(`${clientReq.method} ${clientReq.url} → ${server.id} [${proxyRes.statusCode}] ${latency}ms`);
-    clientRes.writeHead(proxyRes.statusCode, { ...proxyRes.headers, 'x-handled-by': server.id });
+    clientRes.writeHead(proxyRes.statusCode, {
+      ...proxyRes.headers,
+      'x-handled-by' : server.id,
+    });
     proxyRes.pipe(clientRes, { end: true });
   });
 
   proxyReq.on('error', (err) => {
     recordFailure(server.id);
     logger.err(`${server.id} → ${err.message}`);
-    if (server.alive) { server.alive = false; metrics.servers[server.id].alive = false; }
+    if (server.alive) {
+      server.alive = false;
+      metrics.servers[server.id].alive = false;
+    }
     if (attempt <= MAX_RETRIES) {
       const next = getNextLiveBackend(tried);
       if (next) return forwardTo(next, clientReq, clientRes, startMs, attempt + 1, tried);
@@ -190,7 +233,7 @@ function handleRequest(clientReq, clientRes) {
   });
 }
 
-// ── Metrics Server (port 8090) ────────────────────────────────────────────────
+// ── Metrics Server (port 8090) 
 const metricsServer = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -201,7 +244,7 @@ const metricsServer = http.createServer((req, res) => {
   res.writeHead(404); res.end('Not found');
 });
 
-// ── Boot ──────────────────────────────────────────────────────────────────────
+// ── Boot 
 const lbServer = http.createServer(handleRequest);
 lbServer.on('error', (err) => {
   if (err.code === 'EADDRINUSE') { logger.err(`Port ${LB_PORT} already in use.`); process.exit(1); }
