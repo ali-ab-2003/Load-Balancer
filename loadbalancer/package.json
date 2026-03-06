@@ -1,0 +1,12 @@
+{
+  "name": "lb-load-balancer",
+  "version": "1.0.0",
+  "description": "Round-robin load balancer with health checks",
+  "main": "load_balancer_health.js",
+  "scripts": {
+    "start": "node load_balancer_health.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
