@@ -218,7 +218,15 @@ function forwardTo(server, clientReq, clientRes, startMs, attempt = 1, tried = n
 
 function handleRequest(clientReq, clientRes) {
   const startMs = Date.now();
-  const chunks  = [];
+
+  // Serve metrics on the main port at /metrics path
+  if (clientReq.url === '/metrics') {
+    clientRes.setHeader('Access-Control-Allow-Origin', '*');
+    clientRes.writeHead(200, { 'Content-Type': 'application/json' });
+    return clientRes.end(JSON.stringify(getSnapshot(), null, 2));
+  }
+
+  const chunks = [];
   clientReq.on('data', (c) => chunks.push(c));
   clientReq.on('end', () => {
     clientReq._lbBody = Buffer.concat(chunks);
@@ -234,15 +242,15 @@ function handleRequest(clientReq, clientRes) {
 }
 
 // ── Metrics Server (port 8090) 
-const metricsServer = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
-  if (req.url === '/metrics' || req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(getSnapshot(), null, 2));
-  }
-  res.writeHead(404); res.end('Not found');
-});
+// const metricsServer = http.createServer((req, res) => {
+//   res.setHeader('Access-Control-Allow-Origin', '*');
+//   res.setHeader('Access-Control-Allow-Methods', 'GET');
+//   if (req.url === '/metrics' || req.url === '/') {
+//     res.writeHead(200, { 'Content-Type': 'application/json' });
+//     return res.end(JSON.stringify(getSnapshot(), null, 2));
+//   }
+//   res.writeHead(404); res.end('Not found');
+// });
 
 // ── Boot 
 const lbServer = http.createServer(handleRequest);
@@ -254,11 +262,17 @@ lbServer.on('error', (err) => {
 process.on('SIGINT',  () => { lbServer.close(); metricsServer.close(); process.exit(0); });
 process.on('SIGTERM', () => { lbServer.close(); metricsServer.close(); process.exit(0); });
 
+// lbServer.listen(LB_PORT, () => {
+//   logger.info(`Load balancer      → http://localhost:${LB_PORT}`);
+//   startHealthChecks();
+// });
+// metricsServer.listen(METRICS_PORT, () => {
+//   logger.info(`Metrics API        → http://localhost:${METRICS_PORT}/metrics`);
+//   logger.info(`Open dashboard.html in your browser to see live charts`);
+// });
+
 lbServer.listen(LB_PORT, () => {
-  logger.info(`Load balancer      → http://localhost:${LB_PORT}`);
+  logger.info(`Load balancer → http://localhost:${LB_PORT}`);
+  logger.info(`Metrics API   → http://localhost:${LB_PORT}/metrics`);
   startHealthChecks();
-});
-metricsServer.listen(METRICS_PORT, () => {
-  logger.info(`Metrics API        → http://localhost:${METRICS_PORT}/metrics`);
-  logger.info(`Open dashboard.html in your browser to see live charts`);
 });
